@@ -435,10 +435,7 @@ function TabContent({
     case 'tools':
       return wrap('Tools', <McpSection app={app} plugin={plugin} />, '· MCP')
     case 'advanced':
-      return wrap(
-        'Advanced',
-        <ServerActionsSection app={app} plugin={plugin} />,
-      )
+      return wrap('Advanced', <ServerActionsSection />)
     case 'help':
       return (
         <div className="nc-tab-content">

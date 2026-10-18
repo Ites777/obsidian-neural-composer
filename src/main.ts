@@ -42,11 +42,7 @@ import {
 
 export const PLUGIN_NAME = 'Neural Composer'
 export const BACKEND_NAME = 'LightRAG'
-export const TERM_API = 'API'
-export const TERM_LLM = 'LLM'
-export const TERM_LLM_EMBED = 'LLM/Embed'
 export const CMD_INGEST_FOLDER = 'Ingest folder into graph'
-export const VAR_MAX_ASYNC = 'MAX_ASYNC' // Nombre de variable de entorno/configuración
 
 // --- MASTER EXTENSION LIST ---
 const SUPPORTED_EXTENSIONS = [
@@ -122,100 +118,15 @@ const TEXT_BASED_EXTENSIONS = [
   'less',
 ]
 
-// Definition for internal use, as 'Adapter' is not exported directly
-type FileSystemAdapterWithBasePath = {
-  getBasePath: () => string
-}
-
-// --- Minimal Node.js API surface used by this plugin -----------------------
-// Node's built-in modules are loaded dynamically via `window.require` on
-// desktop only (see onload()) so they never appear in the static import graph
-// the Obsidian plugin linter rejects. We deliberately describe only the exact
-// shapes this file (and NativeGraphView, which reuses these instances via
-// `plugin._nodeFs` / `plugin._nodePath`) calls at runtime, rather than typing
-// these fields as `typeof import('fs')` / `typeof import('child_process')` /
-// etc. Those ambient-module type references depend on @types/node resolving
-// identically across every TypeScript/tooling environment this plugin is
-// built or linted in; when that resolution fails or differs, they silently
-// degrade to `any` instead of producing a type error. Local interfaces make
-// the types explicit and environment-independent.
-
-/** A Node Buffer, described only by the capability actually used here. */
-type BufferLike = {
-  toString(encoding?: string): string
-}
-
+// Read-only desktop file access used by NativeGraphView.
 type NodeFsLike = {
   existsSync(path: string): boolean
-  mkdirSync(path: string, options?: { recursive?: boolean }): string | undefined
-  writeFileSync(path: string, data: string): void
   readFileSync(path: string, encoding: string): string
 }
 
 type NodePathLike = {
   join(...paths: string[]): string
 }
-
-type NodeReadableStreamLike = {
-  on(
-    event: 'data',
-    listener: (chunk: BufferLike | string) => void,
-  ): NodeReadableStreamLike
-}
-
-type NodeChildProcessLike = {
-  readonly stdout: NodeReadableStreamLike | null
-  readonly stderr: NodeReadableStreamLike | null
-  kill(signal?: string): boolean
-  on(
-    event: 'close',
-    listener: (code: number | null) => void,
-  ): NodeChildProcessLike
-  on(event: 'error', listener: (err: Error) => void): NodeChildProcessLike
-}
-
-type NodeSpawnOptions = {
-  cwd?: string
-  shell?: boolean
-  env?: Record<string, string | undefined>
-}
-
-type NodeExecSyncOptions = {
-  stdio?: 'ignore' | 'inherit' | 'pipe'
-}
-
-type NodeChildProcessModuleLike = {
-  spawn(
-    command: string,
-    args: string[],
-    options?: NodeSpawnOptions,
-  ): NodeChildProcessLike
-  execSync(command: string, options?: NodeExecSyncOptions): BufferLike | string
-}
-
-type NodeSocketLike = {
-  setTimeout(ms: number): NodeSocketLike
-  once(event: 'error' | 'timeout', listener: () => void): NodeSocketLike
-  connect(port: number, host: string, listener: () => void): NodeSocketLike
-  destroy(): void
-}
-
-type NodeNetModuleLike = {
-  Socket: new () => NodeSocketLike
-}
-
-type NodeProcessLike = {
-  platform: string
-  env: Record<string, string | undefined>
-}
-
-/** Minimal shape of Node's global `process`, used only for the platform name
- *  and the environment variable map. Declared locally (shadowing the ambient
- *  @types/node global within this module only) for the same reason as the
- *  interfaces above — it keeps this file's typing independent of whether
- *  @types/node resolves in a given build environment. This has no runtime
- *  effect: `process` still resolves to the real global object. */
-declare const process: NodeProcessLike | undefined
 
 export default class NeuralComposerPlugin extends Plugin {
   settings: NeuralComposerSettings
@@ -234,8 +145,6 @@ export default class NeuralComposerPlugin extends Plugin {
   // shortcut: this queue is in memory; add persistence if restart recovery is needed.
   private pendingModifiedFiles = new Map<string, TFile>()
   private syncingModifiedFiles = false
-  private serverProcess: NodeChildProcessLike | null = null
-  private lastErrorTime: number = 0
   public docIndexService: DocIndexService | null = null
   private fileExplorerDecorator: FileExplorerDecorator | null = null
   private lastServerStatus: 'online' | 'offline' | 'busy' = 'offline'
@@ -280,29 +189,12 @@ export default class NeuralComposerPlugin extends Plugin {
   // of importing Node built-ins themselves.
   _nodeFs: NodeFsLike | null = null
   _nodePath: NodePathLike | null = null
-  private _nodeChildProcess: NodeChildProcessModuleLike | null = null
-  private _nodeNet: NodeNetModuleLike | null = null
 
   // --- STATUS BAR PROPERTIES ---
   private statusBarEl: HTMLElement
   private statusDotEl: HTMLElement
   private heartbeatInterval: number
 
-  /** Returns true if the user has enabled remote server mode. */
-  isRemoteServer(): boolean {
-    return this.settings.lightRagUseRemote
-  }
-
-  /** Extracts the port number from the configured server URL, with safe fallback. */
-  private getServerPort(): number {
-    try {
-      return parseInt(new URL(this.settings.lightRagServerUrl).port) || 9621
-    } catch {
-      return 9621
-    }
-  }
-
-  /** Returns headers for LightRAG API calls, including auth if configured. */
   private getLightRagHeaders(): Record<string, string> {
     const headers: Record<string, string> = {}
     if (this.settings.lightRagApiKey) {
@@ -325,38 +217,6 @@ export default class NeuralComposerPlugin extends Plugin {
       ).require
       this._nodeFs = nodeRequire('fs') as NodeFsLike
       this._nodePath = nodeRequire('path') as NodePathLike
-      this._nodeChildProcess = nodeRequire(
-        'child_process',
-      ) as NodeChildProcessModuleLike
-      this._nodeNet = nodeRequire('net') as NodeNetModuleLike
-    }
-
-    // --- ZERO-CONFIG & PORTABILITY ---
-    if (Platform.isDesktop && !this.settings.lightRagWorkDir) {
-      // Safe casting to check for desktop adapter capabilities
-      const adapter = this.app.vault.adapter
-
-      if (
-        typeof (adapter as unknown as FileSystemAdapterWithBasePath)
-          .getBasePath === 'function'
-      ) {
-        const vaultRoot = (
-          adapter as unknown as FileSystemAdapterWithBasePath
-        ).getBasePath()
-        const defaultPath = this._nodePath!.join(vaultRoot, '.neural_memory')
-
-        if (!this._nodeFs!.existsSync(defaultPath)) {
-          try {
-            this._nodeFs!.mkdirSync(defaultPath, { recursive: true })
-          } catch (e) {
-            console.error('Failed to create default folder:', e)
-            new Notice('Failed to create default .neural_memory folder.')
-          }
-        }
-
-        this.settings.lightRagWorkDir = defaultPath
-        await this.saveData(this.settings)
-      }
     }
 
     // --- STATUS BAR INITIALIZATION ---
@@ -420,21 +280,6 @@ export default class NeuralComposerPlugin extends Plugin {
       name: 'Add selection to chat',
       editorCallback: (editor: Editor, view: MarkdownView) => {
         void this.addSelectionToChat(editor, view)
-      },
-    })
-
-    // --- QUICK RESTART COMMAND ---
-    this.addCommand({
-      id: 'restart-neural-backend',
-      name: `Restart neural backend (${BACKEND_NAME})`,
-      callback: () => {
-        if (!Platform.isDesktop) {
-          new Notice(
-            'Local server management is only available on desktop. Use remote server mode on mobile.',
-          )
-          return
-        }
-        this.restartLightRagServer()
       },
     })
 
@@ -867,15 +712,8 @@ export default class NeuralComposerPlugin extends Plugin {
 
     this.addSettingTab(new NeuralComposerSettingTab(this.app, this))
 
-    // --- AGGRESSIVE AUTO-START ---
+    // Monitor the independently managed LightRAG server.
     this.app.workspace.onLayoutReady(() => {
-      if (
-        Platform.isDesktop &&
-        this.settings.enableAutoStartServer &&
-        !this.isRemoteServer()
-      ) {
-        void this.startLightRagServer()
-      }
       // --- LATIDO LEGAL Y SEGURO ---
       // registerInterval asegura que el proceso muera si el plugin se apaga
       this.registerInterval(
@@ -1376,7 +1214,6 @@ export default class NeuralComposerPlugin extends Plugin {
     this.docIndexService = null
     this.fileExplorerDecorator?.clear()
     this.fileExplorerDecorator = null
-    this.stopLightRagServer()
   }
 
   /** Apply data-nc-status attributes to files and the watched folder. No DOM injection. */
@@ -1404,348 +1241,6 @@ export default class NeuralComposerPlugin extends Plugin {
     )
   }
 
-  public stopLightRagServer() {
-    if (!Platform.isDesktop) {
-      this.updateStatusUI('offline')
-      return
-    }
-    if (this.serverProcess) {
-      this.serverProcess.kill()
-      this.serverProcess = null
-    }
-    try {
-      if (this._nodeChildProcess && typeof process !== 'undefined') {
-        if (process.platform === 'win32') {
-          this._nodeChildProcess.execSync(
-            'taskkill /F /IM lightrag-server.exe /T',
-            { stdio: 'ignore' },
-          )
-        } else {
-          // macOS / Linux: kill whatever is listening on the server port.
-          // This handles orphaned processes started outside the plugin (e.g.
-          // manually, or from a previous Obsidian session).
-          const port = this.getServerPort()
-          this._nodeChildProcess.execSync(
-            `bash -c "lsof -ti tcp:${port} | xargs kill -9 2>/dev/null || true"`,
-            { stdio: 'ignore' },
-          )
-        }
-      }
-    } catch {
-      // Ignore kill errors if process not found
-    }
-    this.updateStatusUI('offline')
-  }
-
-  public restartLightRagServer(skipEnvUpdate = false) {
-    if (!Platform.isDesktop) {
-      new Notice(
-        'Local server management is only available on desktop. Use remote server mode on mobile.',
-      )
-      return
-    }
-    new Notice('Restarting system backend...')
-    this.stopLightRagServer()
-    // Use timeout to allow process to fully die
-    this.timeoutIds.push(
-      window.setTimeout(() => {
-        if (!skipEnvUpdate) this.updateEnvFile()
-        void this.startLightRagServer()
-      }, 2000),
-    )
-  }
-
-  // Normalizes a provider base URL so it ends with /v1, regardless of how the user entered it.
-  // LightRAG's Python OpenAI client uses base_url directly and expects the /v1 path to be included.
-  private normalizeBindingHost(url: string): string {
-    const trimmed = url.replace(/\/+$/, '') // strip trailing slashes
-    if (trimmed.endsWith('/v1')) return trimmed
-    return `${trimmed}/v1`
-  }
-
-  // GENERATOR
-  public generateEnvConfig(): string {
-    const workDir = this.settings.lightRagWorkDir
-    if (!workDir) return ''
-
-    try {
-      const targetLlmId =
-        this.settings.lightRagModelId || this.settings.chatModelId
-      const embeddingId =
-        this.settings.lightRagEmbeddingModelId || this.settings.embeddingModelId
-
-      const llmModelObj = this.settings.chatModels.find(
-        (m) => m.id === targetLlmId,
-      )
-      const embedModelObj = this.settings.embeddingModels.find(
-        (m) => m.id === embeddingId,
-      )
-
-      const llmProvider = this.settings.providers.find(
-        (p) => p.id === llmModelObj?.providerId,
-      )
-      const embedProvider = this.settings.providers.find(
-        (p) => p.id === embedModelObj?.providerId,
-      )
-
-      let envContent = `# Generated by Neural Composer\n`
-      envContent += `# You can edit this file manually before restarting.\n\n`
-
-      envContent += `WORKING_DIR=${workDir}\n`
-      envContent += `HOST=127.0.0.1\n`
-      envContent += `PORT=${this.getServerPort()}\n`
-      envContent += `SUMMARY_LANGUAGE=${this.settings.lightRagSummaryLanguage || 'English'}\n`
-
-      // --- TUNING VARS ---
-      envContent += `\n# --- Performance Tuning ---\n`
-      envContent += `MAX_ASYNC=${this.settings.lightRagMaxAsync}\n`
-      envContent += `MAX_PARALLEL_INSERT=${this.settings.lightRagMaxParallelInsert}\n`
-      envContent += `CHUNK_SIZE=${this.settings.lightRagChunkSize}\n`
-      envContent += `CHUNK_OVERLAP_SIZE=${this.settings.lightRagChunkOverlap}\n\n`
-
-      // Plugin provider IDs → LightRAG binding names.
-      // LightRAG uses 'google' (not 'gemini') and 'azure_openai' (not 'azure').
-      const LIGHTRAG_BINDING_MAP: Record<string, string> = {
-        gemini: 'google',
-        azure: 'azure_openai',
-      }
-
-      // LLM CONFIGURATION
-      if (llmModelObj && llmProvider) {
-        envContent += `# LLM Configuration\n`
-
-        const nativeProviders = [
-          'openai',
-          'gemini',
-          'ollama',
-          'anthropic',
-          'azure',
-        ]
-
-        // ¿Es un proveedor nativo o uno custom?
-        const isNative = nativeProviders.includes(llmProvider.id)
-
-        if (isNative) {
-          const llmBindingName =
-            LIGHTRAG_BINDING_MAP[llmProvider.id] ?? llmProvider.id
-          envContent += `LLM_BINDING=${llmBindingName}\n`
-
-          if (llmProvider.id === 'ollama' && llmProvider.baseUrl) {
-            envContent += `OLLAMA_HOST=${llmProvider.baseUrl}\n`
-          } else if (llmProvider.baseUrl) {
-            envContent += `LLM_BINDING_HOST=${this.normalizeBindingHost(llmProvider.baseUrl)}\n`
-          }
-          if (llmProvider.apiKey) {
-            envContent += `LLM_BINDING_API_KEY=${llmProvider.apiKey}\n`
-          }
-        } else {
-          // Custom provider: use openai-compatible binding.
-          // Include a fallback base URL for well-known providers that may not
-          // have an explicit baseUrl stored (e.g. openrouter added before this
-          // field was required). Without this, LightRAG silently falls back to
-          // api.openai.com and rejects non-OpenAI keys with a 401 error.
-          const KNOWN_PROVIDER_BASE_URLS: Record<string, string> = {
-            openrouter: 'https://openrouter.ai/api/v1',
-            groq: 'https://api.groq.com/openai/v1',
-            deepseek: 'https://api.deepseek.com',
-            mistral: 'https://api.mistral.ai/v1',
-            perplexity: 'https://api.perplexity.ai',
-            morph: 'https://api.morph.so/v1',
-            'lm-studio': 'http://localhost:1234/v1',
-          }
-          envContent += `LLM_BINDING=openai\n`
-          const resolvedLlmBaseUrl =
-            llmProvider.baseUrl ||
-            KNOWN_PROVIDER_BASE_URLS[llmProvider.id] ||
-            KNOWN_PROVIDER_BASE_URLS[llmProvider.type]
-          if (resolvedLlmBaseUrl) {
-            envContent += `LLM_BINDING_HOST=${this.normalizeBindingHost(resolvedLlmBaseUrl)}\n`
-          }
-          if (llmProvider.apiKey) {
-            envContent += `LLM_BINDING_API_KEY=${llmProvider.apiKey}\n`
-          }
-        }
-
-        envContent += `LLM_MODEL=${llmModelObj.model}\n`
-      }
-
-      // Embeddings (Smart Mapping)
-      if (embedModelObj && embedProvider) {
-        envContent += `\n# Embedding Configuration\n`
-
-        const nativeEmbedProviders = [
-          'openai',
-          'gemini',
-          'ollama',
-          'anthropic',
-          'azure',
-        ]
-        const isNativeEmbed = nativeEmbedProviders.includes(embedProvider.id)
-
-        if (isNativeEmbed) {
-          const embedBindingName =
-            LIGHTRAG_BINDING_MAP[embedProvider.id] ?? embedProvider.id
-          envContent += `EMBEDDING_BINDING=${embedBindingName}\n`
-
-          // LightRAG bug workaround: get_default_host('ollama') reads LLM_BINDING_HOST
-          // as a fallback instead of using a proper Ollama default. When LLM_BINDING_HOST
-          // is set to a remote provider (e.g. OpenRouter), Ollama embedding silently routes
-          // there and gets 404s. Always write EMBEDDING_BINDING_HOST explicitly to prevent this.
-          const NATIVE_EMBED_DEFAULT_HOSTS: Record<string, string> = {
-            ollama: 'http://localhost:11434',
-          }
-          const resolvedNativeEmbedHost =
-            embedProvider.baseUrl ||
-            NATIVE_EMBED_DEFAULT_HOSTS[embedProvider.id]
-          if (resolvedNativeEmbedHost) {
-            // Ollama uses its own /api/* paths — do NOT append /v1
-            const normalizedEmbedHost =
-              embedProvider.id === 'ollama'
-                ? resolvedNativeEmbedHost.replace(/\/+$/, '')
-                : this.normalizeBindingHost(resolvedNativeEmbedHost)
-            envContent += `EMBEDDING_BINDING_HOST=${normalizedEmbedHost}\n`
-          }
-          if (embedProvider.apiKey) {
-            envContent += `EMBEDDING_BINDING_API_KEY=${embedProvider.apiKey}\n`
-          }
-        } else {
-          // Custom provider: use openai-compatible binding with fallback base URL.
-          const KNOWN_EMBED_BASE_URLS: Record<string, string> = {
-            openrouter: 'https://openrouter.ai/api/v1',
-            groq: 'https://api.groq.com/openai/v1',
-            deepseek: 'https://api.deepseek.com',
-            mistral: 'https://api.mistral.ai/v1',
-            perplexity: 'https://api.perplexity.ai',
-            morph: 'https://api.morph.so/v1',
-            'lm-studio': 'http://localhost:1234/v1',
-          }
-          envContent += `EMBEDDING_BINDING=openai\n`
-          const resolvedEmbedBaseUrl =
-            embedProvider.baseUrl ||
-            KNOWN_EMBED_BASE_URLS[embedProvider.id] ||
-            KNOWN_EMBED_BASE_URLS[embedProvider.type]
-          if (resolvedEmbedBaseUrl) {
-            envContent += `EMBEDDING_BINDING_HOST=${this.normalizeBindingHost(resolvedEmbedBaseUrl)}\n`
-          }
-          if (embedProvider.apiKey) {
-            envContent += `EMBEDDING_BINDING_API_KEY=${embedProvider.apiKey}\n`
-          }
-        }
-
-        envContent += `EMBEDDING_MODEL=${embedModelObj.model}\n`
-        envContent += `EMBEDDING_DIM=${embedModelObj.dimension || 1024}\n`
-        envContent += `MAX_TOKEN_SIZE=8192\n`
-      }
-
-      // RERANKING
-      const rerankSelection = this.settings.lightRagRerankBinding
-
-      if (rerankSelection && rerankSelection !== '') {
-        envContent += `\n# Reranking Configuration\n`
-
-        let realBindingName = rerankSelection
-
-        if (rerankSelection === 'custom') {
-          realBindingName = this.settings.lightRagRerankBindingType || 'cohere'
-          envContent += `RERANK_BINDING_HOST=${this.settings.lightRagRerankHost}\n`
-        } else {
-          if (rerankSelection === 'jina')
-            envContent += `RERANK_BINDING_HOST=https://api.jina.ai/v1/rerank\n`
-          if (rerankSelection === 'cohere')
-            envContent += `RERANK_BINDING_HOST=https://api.cohere.com/v2/rerank\n`
-        }
-
-        envContent += `RERANK_BINDING=${realBindingName}\n`
-        envContent += `RERANK_MODEL=${this.settings.lightRagRerankModel}\n`
-        if (this.settings.lightRagRerankApiKey) {
-          envContent += `RERANK_BINDING_API_KEY=${this.settings.lightRagRerankApiKey}\n`
-        }
-      } else {
-        envContent += `\n# Reranking Disabled\n`
-        envContent += `RERANK_BINDING=null\n`
-      }
-
-      // API Keys
-      const providersNeeded = new Set([llmProvider, embedProvider])
-      envContent += `\n# API Keys\n`
-      let openAiKeyWritten = false
-      providersNeeded.forEach((p) => {
-        if (p && p.apiKey) {
-          const keyName = p.id.toUpperCase()
-          if (keyName === 'GEMINI') envContent += `GEMINI_API_KEY=${p.apiKey}\n`
-          if (keyName === 'OPENAI') {
-            envContent += `OPENAI_API_KEY=${p.apiKey}\n`
-            openAiKeyWritten = true
-          }
-          if (keyName === 'ANTHROPIC')
-            envContent += `ANTHROPIC_API_KEY=${p.apiKey}\n`
-        }
-      })
-      // Providers that use LightRAG's "openai" binding (e.g. LM Studio,
-      // OpenRouter, Groq) don't necessarily have an OPENAI_API_KEY, but
-      // LightRAG's Python client accesses os.environ['OPENAI_API_KEY']
-      // directly and raises KeyError when it's absent. Writing a placeholder
-      // satisfies the client without affecting auth (the real key is in
-      // LLM_BINDING_API_KEY / EMBEDDING_BINDING_API_KEY).
-      if (!openAiKeyWritten) {
-        envContent += `OPENAI_API_KEY=no-api-key\n`
-      }
-
-      // Entity Types
-      if (this.settings.useCustomEntityTypes) {
-        const rawTypes = this.settings.lightRagEntityTypes
-        if (rawTypes && rawTypes.trim().length > 0) {
-          const typeList = rawTypes
-            .split(',')
-            .map((t) => t.trim())
-            .filter((t) => t.length > 0)
-          envContent += `\nENTITY_TYPES='${JSON.stringify(typeList)}'\n`
-        }
-      }
-
-      // Custom Overrides
-      if (this.settings.lightRagCustomEnv) {
-        envContent += `\n\n#####################################\n`
-        envContent += `### USER CUSTOM CONFIGURATION     ###\n`
-        envContent += `### (Overrides defaults above)    ###\n`
-        envContent += `#####################################\n`
-        envContent += this.settings.lightRagCustomEnv
-        envContent += `\n`
-      }
-
-      return envContent
-    } catch (err) {
-      console.error('Error generating config:', err)
-      return ''
-    }
-  }
-
-  public saveEnvAndRestart(content: string) {
-    if (!Platform.isDesktop || !this._nodeFs || !this._nodePath) return
-    const workDir = this.settings.lightRagWorkDir
-    if (!workDir) return
-
-    try {
-      const envPath = this._nodePath.join(workDir, '.env')
-      this._nodeFs.writeFileSync(envPath, content)
-      // skipEnvUpdate=true so the manually-edited content is not overwritten
-      this.restartLightRagServer(true)
-    } catch (e) {
-      new Notice('Error saving .env file')
-      console.error(e)
-    }
-  }
-
-  public updateEnvFile() {
-    if (!Platform.isDesktop || !this._nodeFs || !this._nodePath) return
-    const content = this.generateEnvConfig()
-    const workDir = this.settings.lightRagWorkDir
-    if (workDir && content) {
-      const envPath = this._nodePath.join(workDir, '.env')
-      this._nodeFs.writeFileSync(envPath, content)
-    }
-  }
-
   public async reprocessFailedDocuments(): Promise<void> {
     const url = `${this.settings.lightRagServerUrl}/documents/reprocess_failed`
     try {
@@ -1770,169 +1265,8 @@ export default class NeuralComposerPlugin extends Plugin {
     }
   }
 
-  private isPortInUse(port: number): Promise<boolean> {
-    if (!Platform.isDesktop || !this._nodeNet) return Promise.resolve(false)
-    return new Promise((resolve) => {
-      const socket = new this._nodeNet!.Socket()
-
-      const onError = () => {
-        socket.destroy()
-        resolve(false) // Closed
-      }
-
-      socket.setTimeout(500)
-      socket.once('error', onError)
-      socket.once('timeout', onError)
-
-      socket.connect(port, '127.0.0.1', () => {
-        socket.destroy()
-        resolve(true) // Open (In Use)
-      })
-    })
-  }
-
-  async startLightRagServer() {
-    if (!Platform.isDesktop) {
-      new Notice(
-        'Local server is not supported on mobile. Configure a remote server in settings.',
-      )
-      return
-    }
-    if (this.isRemoteServer()) {
-      void this.checkAndUpdateStatus()
-      return
-    }
-
-    const command = this.settings.lightRagCommand
-    const workDir = this.settings.lightRagWorkDir
-
-    if (!workDir || !command) {
-      new Notice(`Configure ${BACKEND_NAME} paths in settings.`)
-      return
-    }
-
-    this.updateEnvFile()
-
-    const isAlive = await this.isPortInUse(this.getServerPort())
-    if (isAlive) {
-      this.updateStatusUI('online') // Si ya está vivo, lo ponemos verde
-      return
-    }
-
-    new Notice(`Starting ${BACKEND_NAME}...`)
-    this.updateStatusUI('busy') // Amarillo mientras arranca
-
-    try {
-      const envVars = typeof process !== 'undefined' ? { ...process.env } : {}
-
-      // --- FIX: SANITIZE PATHS (ESPACIOS EN WINDOWS) ---
-      // Si la ruta tiene espacios y no tiene comillas, las agregamos.
-      const safeWorkDir =
-        workDir.includes(' ') && !workDir.startsWith('"')
-          ? `"${workDir}"`
-          : workDir
-
-      const safeCommand =
-        command.includes(' ') && !command.startsWith('"')
-          ? `"${command}"`
-          : command
-      // ------------------------------------------------
-
-      // Usamos las variables sanitizadas en el comando y argumentos
-      this.serverProcess = this._nodeChildProcess!.spawn(
-        safeCommand,
-        [
-          '--port',
-          `${this.getServerPort()}`,
-          '--working-dir',
-          safeWorkDir,
-          '--workers',
-          '1',
-        ],
-        {
-          cwd: workDir, // cwd usa la ruta original (Node la maneja bien)
-          shell: true,
-          env: { ...envVars, PYTHONIOENCODING: 'utf-8', FORCE_COLOR: '1' },
-        },
-      )
-
-      this.serverProcess.stderr?.on('data', (data: BufferLike | string) => {
-        const msg = String(data)
-        const now = Date.now()
-
-        if (!this.lastErrorTime || now - this.lastErrorTime > 5000) {
-          if (
-            msg.includes('503') ||
-            msg.includes('overloaded') ||
-            msg.includes('UNAVAILABLE')
-          ) {
-            new Notice(
-              'Provider error: model overloaded (503).\nServer is busy, please wait a moment.',
-              0,
-            )
-            this.lastErrorTime = now
-          } else if (msg.includes('Invalid API key') || msg.includes('401')) {
-            if (msg.includes('Rerank'))
-              new Notice(`Rerank error: invalid ${TERM_API} key.`, 0)
-            else
-              new Notice(`${TERM_LLM_EMBED} error: Invalid ${TERM_API} key.`, 0)
-            this.lastErrorTime = now
-          } else if (
-            msg.includes('Quota') ||
-            msg.includes('429') ||
-            msg.includes('RESOURCE_EXHAUSTED')
-          ) {
-            if (msg.includes('Rerank')) new Notice('Rerank quota exceeded.', 0)
-            else if (msg.includes('google') || msg.includes('gemini'))
-              new Notice(
-                `Gemini quota exceeded.\nReduce ${VAR_MAX_ASYNC} in settings.`,
-                0,
-              )
-            else new Notice(`${TERM_API} rate limit hit.`, 0)
-            this.lastErrorTime = now
-          }
-        }
-
-        if (!msg.includes('INFO:') && !msg.includes('WARNING:')) {
-          console.error(`[LightRAG Error]: ${msg}`)
-        }
-      })
-
-      this.serverProcess.on('close', (_code) => {
-        this.serverProcess = null
-        this.updateStatusUI('offline')
-      })
-
-      // --- DETECCIÓN REACTIVA (LINTER SAFE) ---
-      void (async () => {
-        for (let i = 0; i < 15; i++) {
-          await new Promise((r) => window.setTimeout(r, 1000))
-          const alive = await this.isPortInUse(this.getServerPort())
-          if (alive) {
-            this.updateStatusUI('online')
-            new Notice(`${BACKEND_NAME} activated`)
-            return
-          }
-        }
-        this.updateStatusUI('offline')
-        new Notice('Server failed to respond in time.')
-      })()
-    } catch (error) {
-      console.error('Error starting server:', error)
-      new Notice('Fatal error starting server.')
-      this.updateStatusUI('offline')
-    }
-  }
-
   async loadSettings() {
     this.settings = parseNeuralComposerSettings(await this.loadData())
-    // Mobile cannot spawn a local LightRAG server (no child_process / fs).
-    // Force remote-server mode on so the rest of the plugin treats the backend
-    // as remote-only and never tries to auto-start or shell out.
-    if (!Platform.isDesktop) {
-      this.settings.lightRagUseRemote = true
-      this.settings.enableAutoStartServer = false
-    }
     await this.saveData(this.settings)
   }
 
@@ -1941,11 +1275,6 @@ export default class NeuralComposerPlugin extends Plugin {
     if (!validationResult.success) {
       new Notice('Invalid settings')
       return
-    }
-    // If switching to remote mode, stop any running local server
-    if (newSettings.lightRagUseRemote && !this.settings.lightRagUseRemote) {
-      this.stopLightRagServer()
-      void this.checkAndUpdateStatus()
     }
     this.settings = newSettings
     await this.saveData(newSettings)
@@ -2045,10 +1374,6 @@ export default class NeuralComposerPlugin extends Plugin {
             // FIX: Use safe double-casting instead of 'any'
             // We cast to unknown first, then to the expected type.
             {} as unknown as VectorManager,
-            () => {
-              this.restartLightRagServer()
-              return Promise.resolve()
-            },
           )
           resolve(this.ragEngine)
         } catch (error) {
@@ -2073,86 +1398,6 @@ export default class NeuralComposerPlugin extends Plugin {
       this.mcpManager = null
       throw error
     }
-  }
-
-  // --- AUTOMATED ONTOLOGIST ---
-  public async generateEntityTypes(): Promise<string | null> {
-    const sourcePath = this.settings.lightRagOntologyFolder
-
-    if (!sourcePath) {
-      new Notice("Please define an 'ontology source folder' first.")
-      return null
-    }
-
-    const folder = this.app.vault.getAbstractFileByPath(sourcePath)
-    if (!folder || !(folder instanceof TFolder)) {
-      new Notice(`Folder not found: "${sourcePath}"`)
-      return null
-    }
-
-    new Notice(`Analyzing notes in "${sourcePath}"...`)
-
-    try {
-      const allFiles = this.getAllSupportedFiles(folder)
-      if (allFiles.length === 0) throw new Error('Folder is empty.')
-
-      const sampleSize = Math.min(allFiles.length, 5)
-      const sampleFiles = allFiles
-        .sort(() => 0.5 - Math.random())
-        .slice(0, sampleSize)
-
-      let sampleText = ''
-      for (const file of sampleFiles) {
-        const content = await this.app.vault.read(file)
-        sampleText += `--- NOTE: ${file.basename} ---\n${content.substring(0, 1000)}\n...\n\n`
-      }
-
-      const targetLang = this.settings.lightRagSummaryLanguage || 'English'
-
-      const prompt = `
-        ACT AS: Senior Data Ontologist & Knowledge Graph Architect.
-        TASK: Analyze the provided user's "${sourcePath}" folder to extract the fundamental ontology.
-        GOAL: Define a concise list of high-level "Entity Types" that cover the majority of the concepts in the text without being overly granular.
-        
-        GUIDELINES FOR ENTITY TYPES:
-        - **Abstraction:** Prefer broad categories (e.g., use "Organization" instead of "Company", "Startup", "NGO").
-        - **Relevance:** Include types for abstract concepts (e.g., "Concept", "Methodology", "Goal") as LightRAG relies on conceptual connections.
-        - **Coverage:** The list should allow classifying at least 90% of the key nouns in the text.
-        
-        RULES:
-        1. Output ONLY a comma-separated list of types. NO preamble, NO markdown, NO explanations.
-        2. Types must be singular and PascalCase (e.g., ResearchPaper, SoftwareTool).
-        3. Limit the list to the top 8-15 most relevant types.
-        4. CRITICAL: The output types MUST be in ${targetLang}.
-
-        SAMPLE CONTENT:
-        ${sampleText}
-
-        YOUR OUTPUT:
-        `
-
-      const generatedTypes = await this.simpleLLMCall(prompt)
-
-      if (generatedTypes) {
-        const cleanTypes = generatedTypes
-          .replace(/Here are...|Output:|\[|\]/gi, '')
-          .trim()
-
-        await this.setSettings({
-          ...this.settings,
-          lightRagEntityTypes: cleanTypes,
-        })
-
-        new Notice('Ontology generated!')
-        this.updateEnvFile()
-
-        return cleanTypes
-      }
-    } catch (e) {
-      console.error(e)
-      new Notice('Error generating ontology.')
-    }
-    return null
   }
 
   // Simple Helper for LLM Call
@@ -2220,16 +1465,6 @@ export default class NeuralComposerPlugin extends Plugin {
   }
 
   private async checkAndUpdateStatus() {
-    // Si el proceso no existe y no está el auto-start, está offline
-    if (
-      !this.isRemoteServer() &&
-      !this.settings.enableAutoStartServer &&
-      !this.serverProcess
-    ) {
-      this.updateStatusUI('offline')
-      return
-    }
-
     try {
       const response = await requestUrl({
         url: `${this.settings.lightRagServerUrl}/health`,
@@ -2288,33 +1523,18 @@ export default class NeuralComposerPlugin extends Plugin {
       })
     } else {
       this.statusDotEl.addClass('is-offline')
-      const offlineHint = this.isRemoteServer()
-        ? 'check remote server'
-        : 'click to restart'
-      setTooltip(this.statusBarEl, `LightRAG · Offline (${offlineHint})`, {
-        placement: 'top',
-      })
+      setTooltip(
+        this.statusBarEl,
+        'LightRAG · Offline (check server connection)',
+        {
+          placement: 'top',
+        },
+      )
     }
   }
 
   private async handleStatusBarClick() {
-    if (this.isRemoteServer()) {
-      new Notice(`Checking remote ${BACKEND_NAME} server...`)
-      void this.checkAndUpdateStatus()
-      return
-    }
-    if (!Platform.isDesktop) {
-      new Notice(
-        'Configure a remote LightRAG server in settings to use Neural Composer on mobile.',
-      )
-      return
-    }
-    const isAlive = await this.isPortInUse(this.getServerPort())
-    if (!isAlive) {
-      new Notice(`Starting ${BACKEND_NAME} from status bar...`)
-      void this.startLightRagServer()
-    } else {
-      new Notice('System is already online.')
-    }
+    new Notice(`Checking ${BACKEND_NAME} server connection...`)
+    await this.checkAndUpdateStatus()
   }
 }

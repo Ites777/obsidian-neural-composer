@@ -1,5 +1,7 @@
 # Neural Composer
 
+> **KnowledgeHub fork:** LightRAG runs as an independent service. This plugin only connects to its API; it does not start, stop, restart, or write configuration files for the server. The upstream managed-server instructions below do not apply to this fork.
+
 **Graph-based AI chat for your Obsidian vault.**
 
 ![Hero Banner](https://raw.githubusercontent.com/oscampo/obsidian-neural-composer/main/images/hero-banner.GIF)

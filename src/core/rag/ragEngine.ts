@@ -64,7 +64,6 @@ export class RAGEngine {
   private settings: NeuralComposerSettings
   private vectorManager: VectorManager | null = null
   private embeddingModel: EmbeddingModelClient | null = null
-  private restartServerCallback: () => Promise<void>
   private disposed = false
   private reindexQueue: Promise<boolean> = Promise.resolve(true)
 
@@ -72,13 +71,10 @@ export class RAGEngine {
     app: App,
     settings: NeuralComposerSettings,
     vectorManager: VectorManager,
-    restartServerCallback?: () => Promise<void>,
   ) {
     this.app = app
     this.settings = settings
     this.vectorManager = vectorManager
-    this.restartServerCallback =
-      restartServerCallback || (() => Promise.resolve())
     this.embeddingModel = getEmbeddingModelClient({
       settings,
       embeddingModelId: settings.embeddingModelId,
@@ -585,22 +581,7 @@ export class RAGEngine {
     }
 
     try {
-      // FIX: Explicit type for data variable
-      let data: LightRagAPIResponse
-      try {
-        data = await performQuery()
-      } catch (firstError) {
-        console.warn('First attempt failed...', firstError)
-        if (this.settings.enableAutoStartServer) {
-          onQueryProgressChange?.({ type: 'querying' })
-          new Notice('Waking up the system...')
-          await this.restartServerCallback()
-          await new Promise((resolve) => window.setTimeout(resolve, 4000))
-          data = await performQuery()
-        } else {
-          throw firstError
-        }
-      }
+      const data = await performQuery()
 
       const results: RagResult[] = []
       const graphAnswer = data.response || ''

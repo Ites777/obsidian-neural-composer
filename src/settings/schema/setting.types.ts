@@ -88,6 +88,7 @@ export const NeuralComposerSettingsSchema = z.object({
     }),
 
   // --- NEURAL COMPOSER (CORE) ---
+  // Legacy server-management fields are retained for saved-settings compatibility.
   lightRagUseRemote: z.boolean().catch(false),
   lightRagServerUrl: z.string().catch('http://localhost:9621'),
   lightRagApiKey: z.string().catch(''),
