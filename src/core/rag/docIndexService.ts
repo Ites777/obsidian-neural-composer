@@ -33,6 +33,7 @@ type LRDoc = {
  */
 export class DocIndexService {
   private index: Record<string, DocRecord> = {}
+  private localReindexes = new Set<string>()
   private saveTimer: number | null = null
   private pipelineTimer: number | null = null
   private onUpdate: (() => void) | null = null
@@ -112,6 +113,18 @@ export class DocIndexService {
     this.scheduleSave()
   }
 
+  startReindex(vaultPath: string, mtime: number): void {
+    this.localReindexes.add(vaultPath)
+    this.setProcessing(vaultPath, mtime)
+  }
+
+  finishReindex(vaultPath: string, success: boolean): void {
+    if (success) {
+      this.localReindexes.delete(vaultPath)
+      this.setProcessed(vaultPath)
+    } else this.setFailed(vaultPath)
+  }
+
   setProcessed(vaultPath: string, docId?: string): void {
     const rec = this.index[vaultPath] ?? {}
     this.index[vaultPath] = { ...rec, status: 'processed', docId }
@@ -132,6 +145,7 @@ export class DocIndexService {
    * Preserved across syncFromServer() calls — not reset to 'unknown'.
    */
   setRemoved(vaultPath: string): void {
+    this.localReindexes.delete(vaultPath)
     const rec = this.index[vaultPath] ?? {}
     this.index[vaultPath] = { ...rec, status: 'removed', docId: undefined }
     this.notify()
@@ -139,6 +153,7 @@ export class DocIndexService {
   }
 
   removeEntry(vaultPath: string): void {
+    this.localReindexes.delete(vaultPath)
     delete this.index[vaultPath]
     this.notify()
     this.scheduleSave()
@@ -367,6 +382,8 @@ export class DocIndexService {
       let anyProcessing = false
 
       for (const file of files) {
+        // A processed old record must not hide a pending or failed local update.
+        if (this.localReindexes.has(file.path)) continue
         // Three match strategies (in priority order):
         //   1. Exact vault-relative path  ("Research/doc.md" === file.path)
         //   2. Bare filename              ("doc.md" === file.name)
@@ -487,6 +504,7 @@ export class DocIndexService {
   // ── Lifecycle ──────────────────────────────────────────────────────────────
 
   destroy(): void {
+    this.localReindexes.clear()
     this.stopPipelineWatch()
     if (this.saveTimer) {
       window.clearTimeout(this.saveTimer)

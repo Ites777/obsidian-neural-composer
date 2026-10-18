@@ -231,6 +231,9 @@ export default class NeuralComposerPlugin extends Plugin {
 
   private timeoutIds: number[] = []
   private modifyDebounceMap: Map<string, number> = new Map()
+  // shortcut: this queue is in memory; add persistence if restart recovery is needed.
+  private pendingModifiedFiles = new Map<string, TFile>()
+  private syncingModifiedFiles = false
   private serverProcess: NodeChildProcessLike | null = null
   private lastErrorTime: number = 0
   public docIndexService: DocIndexService | null = null
@@ -543,6 +546,56 @@ export default class NeuralComposerPlugin extends Plugin {
       return filePath === syncFolder || filePath.startsWith(normalized)
     }
 
+    const syncModifiedFiles = async () => {
+      if (this.syncingModifiedFiles) return
+      this.syncingModifiedFiles = true
+      try {
+        while (this.docIndexReady && this.pendingModifiedFiles.size > 0) {
+          const [path, file] = this.pendingModifiedFiles.entries().next()
+            .value as [string, TFile]
+          this.pendingModifiedFiles.delete(path)
+          const index = this.docIndexService
+          if (
+            !index ||
+            file.path !== path ||
+            this.app.vault.getAbstractFileByPath(path) !== file ||
+            !isInSyncFolder(path) ||
+            this.isPathExcludedFromGraph(path) ||
+            index.getStatus(path) === 'removed' ||
+            (!index.needsIngestion(path, file.stat.mtime) &&
+              index.getMtime(path) === file.stat.mtime)
+          )
+            continue
+
+          const mtime = file.stat.mtime
+          const notice = new Notice(`Graph sync: updating "${file.name}"...`, 0)
+          index.startReindex(path, mtime)
+          let ok = false
+          try {
+            const ragEngine = await this.getRAGEngine()
+            if (!this.docIndexReady) break
+            ok = await ragEngine.reindexFile(file)
+          } catch (error) {
+            console.error('Graph sync: document update failed', error)
+          } finally {
+            if (this.docIndexReady) index.finishReindex(path, ok)
+            notice.hide()
+          }
+          if (!this.docIndexReady) break
+          new Notice(
+            ok
+              ? `Graph sync: "${file.name}" updated.`
+              : `Graph sync: failed to update "${file.name}". Use Reprocess document to retry.`,
+          )
+          if (file.path === path && file.stat.mtime !== mtime) {
+            this.pendingModifiedFiles.set(path, file)
+          }
+        }
+      } finally {
+        this.syncingModifiedFiles = false
+      }
+    }
+
     this.registerEvent(
       this.app.vault.on('create', (file) => {
         if (!(file instanceof TFile)) return
@@ -699,34 +752,9 @@ export default class NeuralComposerPlugin extends Plugin {
         if (existing) window.clearTimeout(existing)
         const id = window.setTimeout(() => {
           this.modifyDebounceMap.delete(file.path)
-          void (async () => {
-            if (!this.docIndexReady) return
-            // Skip if not modified since last ingestion
-            if (
-              this.docIndexService &&
-              !this.docIndexService.needsIngestion(file.path, file.stat.mtime)
-            ) {
-              return
-            }
-            const notice = new Notice(
-              `Graph sync: re-indexing "${file.name}"...`,
-              0,
-            )
-            const ragEngine = await this.getRAGEngine()
-            this.docIndexService?.setProcessing(file.path, file.stat.mtime)
-            const ok = await ragEngine.reindexFile(file)
-            if (!ok) {
-              this.docIndexService?.setFailed(file.path)
-            } else {
-              this.docIndexService?.startPipelineWatch(1000)
-            }
-            notice.setMessage(
-              ok
-                ? `Graph sync: "${file.name}" sent — processing in background.`
-                : `Graph sync: failed to re-index "${file.name}".`,
-            )
-            window.setTimeout(() => notice.hide(), 6000)
-          })()
+          if (!this.docIndexReady) return
+          this.pendingModifiedFiles.set(file.path, file)
+          void syncModifiedFiles()
         }, 5000)
         this.modifyDebounceMap.set(file.path, id)
       }),
@@ -761,16 +789,11 @@ export default class NeuralComposerPlugin extends Plugin {
                 .onClick(() => {
                   void (async () => {
                     const ragEngine = await this.getRAGEngine()
-                    this.docIndexService!.setProcessing(
-                      file.path,
-                      file.stat.mtime,
-                    )
-                    const ok = await ragEngine.ingestFile(file)
-                    if (!ok) {
-                      this.docIndexService!.setFailed(file.path)
-                    } else {
-                      this.docIndexService!.startPipelineWatch(1000)
-                    }
+                    const path = file.path
+                    const index = this.docIndexService!
+                    index.startReindex(path, file.stat.mtime)
+                    const ok = await ragEngine.reindexFile(file)
+                    if (this.docIndexReady) index.finishReindex(path, ok)
                   })()
                 }),
             )
@@ -1322,6 +1345,8 @@ export default class NeuralComposerPlugin extends Plugin {
   // --- LIFECYCLE & SERVER MANAGEMENT ---
 
   onunload() {
+    this.docIndexReady = false
+    this.pendingModifiedFiles.clear()
     window.clearInterval(this.heartbeatInterval)
     this.timeoutIds.forEach((id) => window.clearTimeout(id))
     this.timeoutIds = []

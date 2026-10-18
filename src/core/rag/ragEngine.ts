@@ -41,6 +41,13 @@ type LightRagAPIResponse = {
   [key: string]: unknown // Allow other props safely
 }
 
+type IndexedDocument = {
+  id: string
+  file_path: string
+  status: string
+  error_msg?: string | null
+}
+
 /**
  * Count how many times reference [N] is explicitly cited in the response text.
  * LightRAG embeds markers like "[1]", "[2]" in the generated answer when
@@ -58,6 +65,8 @@ export class RAGEngine {
   private vectorManager: VectorManager | null = null
   private embeddingModel: EmbeddingModelClient | null = null
   private restartServerCallback: () => Promise<void>
+  private disposed = false
+  private reindexQueue: Promise<boolean> = Promise.resolve(true)
 
   constructor(
     app: App,
@@ -77,6 +86,7 @@ export class RAGEngine {
   }
 
   cleanup() {
+    this.disposed = true
     this.embeddingModel = null
     this.vectorManager = null
   }
@@ -139,7 +149,10 @@ export class RAGEngine {
   }
 
   // --- 2. BINARY INGESTION (Manual Multipart) ---
-  async uploadDocument(file: TFile): Promise<boolean> {
+  async uploadDocument(
+    file: TFile,
+    beforeSubmit?: () => void,
+  ): Promise<boolean> {
     try {
       const fileData = await this.app.vault.readBinary(file)
 
@@ -158,6 +171,7 @@ export class RAGEngine {
       bodyBuffer.set(new Uint8Array(fileData), preBuffer.length)
       bodyBuffer.set(postBuffer, preBuffer.length + fileData.byteLength)
 
+      beforeSubmit?.()
       const response = await requestUrl({
         url: `${this.settings.lightRagServerUrl}/documents/upload`,
         method: 'POST',
@@ -184,50 +198,54 @@ export class RAGEngine {
 
   // --- 2b. INCREMENTAL SYNC HELPERS ---
 
-  /**
-   * Paginates through ALL pages of /documents/paginated and returns every
-   * document's id + file_path. The API caps page_size at 200, so large vaults
-   * span multiple pages. `onPage` lets callers short-circuit the walk (return
-   * true to stop) — used by findDocIdByFilePath to stop as soon as it finds
-   * its target without fetching the remaining pages.
-   */
-  private async listAllDocuments(
-    onPage?: (docs: { id: string; file_path?: string | null }[]) => boolean,
-  ): Promise<{ id: string; file_path: string }[]> {
+  private async listAllDocuments(): Promise<IndexedDocument[]> {
     const pageSize = 200
-    const out: { id: string; file_path: string }[] = []
+    const out: IndexedDocument[] = []
     let page = 1
-    try {
-      while (page <= 1000) {
-        const response = await requestUrl({
-          url: `${this.settings.lightRagServerUrl}/documents/paginated`,
-          method: 'POST',
-          headers: this.getLightRagHeaders(),
-          body: JSON.stringify({
-            page,
-            page_size: pageSize,
-            sort_field: 'file_path',
-            sort_direction: 'asc',
-          }),
-          throw: false,
-        })
-        if (response.status >= 400) break
-        const data = response.json as {
-          documents?: { id: string; file_path?: string | null }[]
-          pagination?: { has_next?: boolean }
-        }
-        const docs = data.documents ?? []
-        for (const doc of docs) {
-          if (typeof doc.file_path === 'string' && doc.file_path.length > 0) {
-            out.push({ id: doc.id, file_path: doc.file_path })
-          }
-        }
-        if (onPage && onPage(docs)) break
-        if (!data.pagination?.has_next) break
-        page++
+    for (;;) {
+      const response = await requestUrl({
+        url: `${this.settings.lightRagServerUrl}/documents/paginated`,
+        method: 'POST',
+        headers: this.getLightRagHeaders(),
+        body: JSON.stringify({
+          page,
+          page_size: pageSize,
+          sort_field: 'file_path',
+          sort_direction: 'asc',
+        }),
+        throw: false,
+      })
+      if (response.status >= 400) {
+        throw new Error(`Cannot list documents: HTTP ${response.status}`)
       }
-    } catch (e) {
-      console.error('listAllDocuments failed:', e)
+      const data = response.json as {
+        documents?: IndexedDocument[]
+        pagination?: { has_next?: boolean }
+      }
+      const docs = data.documents
+      if (
+        !Array.isArray(docs) ||
+        typeof data.pagination?.has_next !== 'boolean' ||
+        docs.some(
+          (doc) =>
+            !doc ||
+            typeof doc.id !== 'string' ||
+            typeof doc.file_path !== 'string' ||
+            typeof doc.status !== 'string',
+        )
+      ) {
+        throw new Error('Invalid document list response')
+      }
+      for (const doc of docs) {
+        if (doc.file_path.length > 0) {
+          out.push(doc)
+        }
+      }
+      if (!data.pagination.has_next) break
+      if (docs.length === 0 || page >= 1000) {
+        throw new Error('Incomplete document pagination')
+      }
+      page++
     }
     return out
   }
@@ -283,42 +301,36 @@ export class RAGEngine {
     filePath: string,
     fileName: string,
   ): Promise<string | null> {
-    try {
-      const response = await requestUrl({
-        url: `${this.settings.lightRagServerUrl}/documents/paginated`,
-        method: 'POST',
-        headers: this.getLightRagHeaders(),
-        body: JSON.stringify({
-          page: 1,
-          page_size: 200,
-          sort_field: 'file_path',
-          sort_direction: 'asc',
-        }),
-        throw: false,
-      })
-      if (response.status >= 400) return null
-      const data = response.json as {
-        documents?: { id: string; file_path: string }[]
+    return (await this.findDocument(filePath, fileName))?.id ?? null
+  }
+
+  private async findDocument(
+    filePath: string,
+    fileName: string,
+  ): Promise<IndexedDocument | undefined> {
+    const docs = await this.listAllDocuments()
+    let matches = docs.filter((doc) => doc.file_path === filePath)
+    if (matches.length === 0) {
+      matches = docs.filter((doc) => doc.file_path === fileName)
+      if (
+        matches.length > 0 &&
+        this.app.vault.getFiles().filter((file) => file.name === fileName)
+          .length !== 1
+      ) {
+        throw new Error(`Ambiguous legacy document name: ${fileName}`)
       }
-      const docs = data.documents ?? []
-      // Prefer exact full-path match, fall back to bare filename for older entries
-      return (
-        docs.find((d) => d.file_path === filePath)?.id ??
-        docs.find((d) => d.file_path === fileName)?.id ??
-        null
-      )
-    } catch {
-      return null
     }
+    if (matches.length > 1) throw new Error(`Ambiguous document: ${filePath}`)
+    return matches[0]
   }
 
   async deleteDocumentByFilePath(
     filePath: string,
     fileName: string,
   ): Promise<boolean> {
-    const docId = await this.findDocIdByFilePath(filePath, fileName)
-    if (!docId) return false
     try {
+      const docId = await this.findDocIdByFilePath(filePath, fileName)
+      if (!docId) return false
       const response = await requestUrl({
         url: `${this.settings.lightRagServerUrl}/documents/delete_document`,
         method: 'DELETE',
@@ -336,14 +348,138 @@ export class RAGEngine {
     }
   }
 
-  // Removes old entry and re-inserts the current file content.
-  async reindexFile(file: TFile): Promise<boolean> {
-    await this.deleteDocumentByFilePath(file.path, file.name)
-    return this.ingestFile(file)
+  reindexFile(file: TFile): Promise<boolean> {
+    const path = file.path
+    const settings = this.settings
+    const result = this.reindexQueue.then(() =>
+      this.performReindex(file, path, settings),
+    )
+    this.reindexQueue = result.catch(() => false)
+    return result
+  }
+
+  private async performReindex(
+    file: TFile,
+    path: string,
+    settings: NeuralComposerSettings,
+  ): Promise<boolean> {
+    const serverUrl = settings.lightRagServerUrl
+    const apiKey = settings.lightRagApiKey
+    const deadline = Date.now() + 30 * 60 * 1000
+    const assertCurrent = () => {
+      if (
+        this.disposed ||
+        serverUrl !== this.settings.lightRagServerUrl ||
+        apiKey !== this.settings.lightRagApiKey ||
+        file.path !== path ||
+        this.app.vault.getAbstractFileByPath(path) !== file ||
+        isExcludedFromGraphSync(path, {
+          excludePatterns: this.settings.lightRagExcludePatterns,
+          excludeHiddenFiles: this.settings.lightRagExcludeHiddenFiles,
+        })
+      ) {
+        throw new Error(
+          'Document update cancelled: source or connection changed',
+        )
+      }
+    }
+    const waitUntil = async (check: () => Promise<boolean>) => {
+      for (;;) {
+        assertCurrent()
+        if (Date.now() >= deadline) throw new Error('Document update timed out')
+        const ready = await check()
+        assertCurrent()
+        if (ready) return
+        await new Promise((resolve) => window.setTimeout(resolve, 1000))
+      }
+    }
+    const isIdle = async () => {
+      const response = await requestUrl({
+        url: `${serverUrl}/documents/pipeline_status`,
+        method: 'GET',
+        headers: this.getLightRagHeaders(),
+        throw: false,
+      })
+      const status = response.json as {
+        busy?: boolean
+        destructive_busy?: boolean
+        scanning?: boolean
+        pending_enqueues?: number
+        recovery_required?: boolean
+      }
+      if (response.status >= 400 || typeof status.busy !== 'boolean') {
+        throw new Error('Cannot read pipeline status')
+      }
+      if (status.recovery_required)
+        throw new Error('LightRAG requires recovery')
+      return (
+        !status.busy &&
+        !status.destructive_busy &&
+        !status.scanning &&
+        !status.pending_enqueues
+      )
+    }
+
+    try {
+      await waitUntil(isIdle)
+      const previous = await this.findDocument(path, file.name)
+      assertCurrent()
+      if (previous) {
+        await waitUntil(async () => {
+          if (!(await isIdle())) return false
+          assertCurrent()
+          const response = await requestUrl({
+            url: `${serverUrl}/documents/delete_document`,
+            method: 'DELETE',
+            headers: this.getLightRagHeaders(),
+            body: JSON.stringify({
+              doc_ids: [previous.id],
+              delete_file: false,
+              delete_llm_cache: true,
+            }),
+            throw: false,
+          })
+          if (response.status >= 400)
+            throw new Error(`Delete failed: HTTP ${response.status}`)
+          const status = response.json as { status?: string }
+          if (status.status === 'busy') return false
+          if (status.status !== 'deletion_started')
+            throw new Error('Deletion was not accepted')
+          return true
+        })
+        await waitUntil(
+          async () =>
+            (await isIdle()) &&
+            !(await this.listAllDocuments()).some(
+              (doc) => doc.id === previous.id,
+            ),
+        )
+      }
+
+      await waitUntil(isIdle)
+      assertCurrent()
+      if (!(await this.ingestFile(file, assertCurrent))) return false
+      await waitUntil(async () => {
+        const doc = await this.findDocument(path, file.name)
+        if (doc?.status.toLowerCase() === 'failed') {
+          throw new Error(doc.error_msg || 'Document processing failed')
+        }
+        return doc?.status.toLowerCase() === 'processed'
+      })
+      return true
+    } catch (error) {
+      console.error('Document update failed:', error)
+      if (!this.disposed) {
+        new Notice(
+          `Graph sync: ${path}: ${error instanceof Error ? error.message : String(error)}`,
+        )
+      }
+      return false
+    }
   }
 
   // Inserts a file into the index without deleting first.
-  async ingestFile(file: TFile): Promise<boolean> {
+  async ingestFile(file: TFile, beforeSubmit?: () => void): Promise<boolean> {
     // Defense-in-depth: callers already gate excluded files, but this
     // prevents any future call site from bypassing exclusion settings.
     if (
@@ -361,9 +497,10 @@ export class RAGEngine {
       const content = await this.app.vault.read(file)
       const finalContent =
         ext === 'md' ? `Title: ${file.basename}\n\n${content}` : content
+      beforeSubmit?.()
       return this.insertDocument(finalContent, file.path)
     }
-    return this.uploadDocument(file)
+    return this.uploadDocument(file, beforeSubmit)
   }
 
   // --- 3. MASTER QUERY ---
